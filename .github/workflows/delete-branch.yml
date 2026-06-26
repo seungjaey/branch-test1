@@ -1,0 +1,155 @@
+# 축 3 (표준화) — 머지 완료된 브랜치 수동 삭제
+#
+# 브랜치명을 입력받아 원격 브랜치를 삭제합니다.
+# 기본 동작: main에 머지된 브랜치만 삭제 (커밋 손실 방지).
+# force=true: 미머지 브랜치도 강제 삭제 (커밋 손실 주의).
+#
+# [보호 정책]
+# - main 브랜치는 입력 시 즉시 거부합니다.
+# - release/*, hotfix/* 는 룰셋(deletion 규칙)이 플랫폼 수준에서 삭제를 차단합니다.
+#   워크플로는 거부하지 않지만, git push 단계에서 GitHub이 에러를 반환합니다.
+#
+# [머지 여부 판정 — squash-only 환경]
+# squash merge는 git ancestry를 보존하지 않으므로 두 방식을 OR 조합합니다:
+#   (a) 머지된 PR 존재 여부 (gh pr list --state merged)
+#   (b) git merge-base --is-ancestor (merge commit이 있는 경우 보완)
+# 둘 중 하나라도 통과하면 머지됐다고 판단합니다.
+
+name: delete-branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: '삭제할 브랜치명 (예: feature/login, hotfix/1)'
+        required: true
+        type: string
+      force:
+        description: 'main 미머지 브랜치도 강제 삭제 (커밋 손실 주의)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  delete:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 브랜치명 검증 (injection 방지)
+        # inputs.branch는 신뢰할 수 없는 입력 — 셸 사용 전에 반드시 검증
+        env:
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          if ! printf '%s' "$BRANCH" | grep -qE '^[a-zA-Z0-9/_.-]+$'; then
+            echo "::error::유효하지 않은 브랜치명입니다: 영문자·숫자·/ _ - . 만 허용됩니다."
+            exit 1
+          fi
+
+          if [ "$BRANCH" = "main" ]; then
+            echo "::error::main 브랜치는 삭제할 수 없습니다."
+            exit 1
+          fi
+
+          echo "브랜치명 검증 통과: $BRANCH"
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 원격 브랜치 존재 확인
+        env:
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          if ! git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
+            echo "::error::원격 브랜치가 존재하지 않습니다: $BRANCH"
+            exit 1
+          fi
+          echo "원격 브랜치 확인됨: $BRANCH"
+
+      - name: main 머지 여부 확인
+        if: ${{ inputs.force != true }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          git fetch origin main "$BRANCH" --quiet
+          MERGED=false
+
+          # (a) 머지된 PR 존재 여부 — squash merge 환경에서 1차 판정
+          # 주의: jq '// empty' 는 일부 버전에서 exit 5 → '// ""' 로 안전하게 처리
+          PR_NUMBER=$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --head "$BRANCH" \
+            --base main \
+            --state merged \
+            --limit 1 \
+            --json number \
+            | jq -r '.[0].number // ""')
+
+          if [ -n "$PR_NUMBER" ]; then
+            echo "  머지된 PR #$PR_NUMBER 확인됨 → 삭제 진행"
+            MERGED=true
+          fi
+
+          # (b) git ancestry — merge commit이 있는 경우 보완 판정
+          if [ "$MERGED" = "false" ]; then
+            if git merge-base --is-ancestor "origin/$BRANCH" "origin/main" 2>/dev/null; then
+              echo "  git ancestry 확인됨 (origin/$BRANCH는 origin/main의 조상) → 삭제 진행"
+              MERGED=true
+            fi
+          fi
+
+          if [ "$MERGED" = "false" ]; then
+            echo "::error::$BRANCH 가 main에 머지된 흔적이 없습니다."
+            echo "::error::PR을 확인하거나, 미머지 브랜치를 삭제하려면 force=true 로 재실행하세요."
+            exit 1
+          fi
+
+      - name: 브랜치 삭제
+        env:
+          BRANCH: ${{ inputs.branch }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          if [ "$FORCE" = "true" ]; then
+            echo "::warning::force=true — 미머지 상태에서 강제 삭제합니다: $BRANCH (커밋 손실 가능)"
+          fi
+
+          if git push origin --delete "$BRANCH" 2>/tmp/delete_err; then
+            echo "✅ 원격 브랜치 삭제됨: $BRANCH"
+          else
+            DELETE_ERR=$(cat /tmp/delete_err)
+            echo "::error::브랜치 삭제에 실패했습니다: $DELETE_ERR"
+            if echo "$DELETE_ERR" | grep -qi 'protected\|ruleset\|declined\|denied'; then
+              echo "::error::이 브랜치는 GitHub 룰셋(deletion 규칙)에 의해 보호되고 있을 수 있습니다."
+              echo "::error::Settings → Rules → Rulesets 에서 deletion 규칙을 확인하세요."
+            fi
+            rm -f /tmp/delete_err
+            exit 1
+          fi
+          rm -f /tmp/delete_err
+
+      - name: Slack 알림 — 브랜치 삭제 완료
+        if: ${{ env.SLACK_WEBHOOK_URL != '' }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          BRANCH: ${{ inputs.branch }}
+          ACTOR: ${{ github.actor }}
+          FORCE: ${{ inputs.force }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          FORCE_LABEL=""
+          if [ "$FORCE" = "true" ]; then
+            FORCE_LABEL=" *(force=true)*"
+          fi
+
+          PAYLOAD=$(jq -n \
+            --arg branch "$BRANCH" \
+            --arg actor "$ACTOR" \
+            --arg force_label "$FORCE_LABEL" \
+            --arg url "$RUN_URL" \
+            '{text: "🗑️ *브랜치 삭제됨*\n브랜치: `\($branch)`\($force_label)\n실행자: \($actor)\n<\($url)|Actions 로그>"}')
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"
