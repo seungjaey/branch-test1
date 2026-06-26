@@ -15,6 +15,7 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:  # 수동 재실행·디버깅용
 
 permissions:
   contents: write
@@ -73,14 +74,15 @@ jobs:
             # main과 diff가 있는지 확인 (이미 동기화된 경우 skip)
             DIFF_COUNT=$(git rev-list --count "origin/$BRANCH..origin/main" 2>/dev/null || echo "0")
             if [ "$DIFF_COUNT" -eq 0 ]; then
-              echo "$BRANCH 는 이미 main과 동기화돼 있습니다. skip."
+              echo "  $BRANCH 는 이미 main과 동기화돼 있습니다. skip."
               continue
             fi
             echo "  main이 $DIFF_COUNT 커밋 앞서 있음 → merge-in PR 생성"
 
             PR_TITLE="[merge-in] main → $BRANCH @ $SHORT_SHA"
 
-            # 이미 동일 제목의 open PR이 있는지 확인 (중복 방지)
+            # 이미 open merge-in PR 있는지 확인 (중복 방지)
+            # 주의: jq '// empty' 는 일부 버전에서 exit 5 → '// ""' 로 안전하게 처리
             EXISTING=$(gh pr list \
               --repo "$GITHUB_REPOSITORY" \
               --base "$BRANCH" \
@@ -88,39 +90,57 @@ jobs:
               --state open \
               --limit 1 \
               --json number \
-              | jq '.[0].number // empty')
+              | jq -r '.[0].number // ""')
 
             if [ -n "$EXISTING" ]; then
               echo "  이미 open PR #$EXISTING 이 있습니다. skip."
               continue
             fi
 
-            # PR body를 jq로 구성 (셸 인젝션 방지)
-            PR_BODY=$(jq -rn \
+            # PR body를 tmpfile에 기록 (multiline + 특수문자 안전 처리)
+            BODY_FILE=$(mktemp)
+            jq -rn \
               --arg branch "$BRANCH" \
               --arg sha "$MAIN_SHA" \
-              '"## auto merge-in\n\nmain의 신규 커밋을 `\($branch)`로 흡수합니다.\n\n- main SHA: `\($sha)`\n- 동기화 방식: **squash merge** (커밋 해시 불변, force push 없음)\n\n> `verify-sync` 체크는 이 PR의 제목에서 main SHA를 파싱합니다."')
+              '"## auto merge-in\n\nmain의 신규 커밋을 `\($branch)`로 흡수합니다.\n\n- main SHA: `\($sha)`\n- 동기화 방식: **squash merge** (커밋 해시 불변, force push 없음)\n\n> `verify-sync` 체크는 이 PR의 제목에서 main SHA를 파싱합니다."' \
+              > "$BODY_FILE"
 
-            # PR 생성
+            # PR 생성 — stdout(URL)과 stderr(에러) 분리
+            PR_URL=""
+            PR_ERR=""
             PR_URL=$(gh pr create \
               --repo "$GITHUB_REPOSITORY" \
               --base "$BRANCH" \
               --head main \
               --title "$PR_TITLE" \
-              --body "$PR_BODY" 2>&1)
+              --body-file "$BODY_FILE" 2>/tmp/pr_err) || PR_ERR=$(cat /tmp/pr_err)
+            rm -f "$BODY_FILE" /tmp/pr_err
 
+            if [ -n "$PR_ERR" ]; then
+              echo "  ::warning::PR 생성 실패: $PR_ERR"
+              continue
+            fi
             echo "  PR 생성됨: $PR_URL"
 
-            # auto-merge 활성화 (squash — release ruleset에 맞춤)
-            PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$')
-            if [ -n "$PR_NUMBER" ]; then
-              gh pr merge "$PR_NUMBER" \
+            # PR 번호 추출 (URL 마지막 숫자)
+            PR_NUMBER=$(printf '%s' "$PR_URL" | grep -oE '[0-9]+$')
+            if [ -z "$PR_NUMBER" ]; then
+              echo "  ::warning::PR 번호를 파싱하지 못했습니다 (URL: $PR_URL)"
+              continue
+            fi
+
+            # auto-merge 활성화 (squash — release/hotfix 룰셋에 맞춤)
+            if gh pr merge "$PR_NUMBER" \
                 --repo "$GITHUB_REPOSITORY" \
                 --squash \
-                --auto \
-                2>&1 && echo "  auto-merge(squash) 활성화됨" \
-                      || echo "  ::warning::auto-merge 활성화 실패 (충돌 가능) — PR을 수동으로 확인하세요: $PR_URL"
+                --auto 2>/tmp/merge_err; then
+              echo "  auto-merge(squash) 활성화됨 → PR #$PR_NUMBER"
+            else
+              MERGE_ERR=$(cat /tmp/merge_err)
+              echo "  ::warning::auto-merge 활성화 실패: $MERGE_ERR"
+              echo "  PR을 수동으로 확인하세요: $PR_URL"
             fi
+            rm -f /tmp/merge_err
           done
 
       - name: Slack 알림 — merge-in 완료
