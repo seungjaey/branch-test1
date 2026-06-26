@@ -1,0 +1,55 @@
+# 축 2 (탐지) — defense-in-depth: force push 감지
+#
+# Ruleset이 force push를 이미 플랫폼 수준에서 차단하므로
+# 이 워크플로는 실효적으로 거의 발화하지 않습니다.
+# 목적: 차단 우회(bypass 권한 사용 등)가 발생했을 때 감사 로그 및 알림.
+
+name: detect-force-push
+
+on:
+  push:
+    branches:
+      - main
+      - "release/**"
+      - "hotfix/**"
+
+jobs:
+  detect:
+    if: ${{ github.event.forced }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Force push detected — audit log
+        env:
+          GH_REF: ${{ github.ref }}
+          GH_ACTOR: ${{ github.actor }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.event.after }}
+        run: |
+          echo "::error::⚠️ Force push detected on $GH_REF by $GH_ACTOR"
+          echo "Before SHA: $BEFORE_SHA"
+          echo "After SHA:  $AFTER_SHA"
+          echo "Please investigate immediately."
+
+      - name: Slack 알림 (SLACK_WEBHOOK_URL 설정 시 활성화)
+        if: ${{ env.SLACK_WEBHOOK_URL != '' }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GH_REF: ${{ github.ref }}
+          GH_ACTOR: ${{ github.actor }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.event.after }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          PAYLOAD=$(jq -n \
+            --arg ref "$GH_REF" \
+            --arg actor "$GH_ACTOR" \
+            --arg before "$BEFORE_SHA" \
+            --arg after "$AFTER_SHA" \
+            --arg url "$RUN_URL" \
+            '{text: "⚠️ *Force push detected*\nBranch: `\($ref)`\nActor: `\($actor)`\nBefore: `\($before)`\nAfter: `\($after)`\n<\($url)|Run log>"}')
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"
+
+      - name: Fail job (감사 목적)
+        run: exit 1
